@@ -37,8 +37,7 @@ import (
 )
 
 const (
-	resyncPeriod = 120 * time.Second
-	maxRetries   = 10
+	maxRetries = 10
 	// JobContainerName is name of the container running the cleanup process.
 	JobContainerName = "cleaner"
 	// JobNamePrefix is the prefix of the name of the cleaning job.
@@ -49,41 +48,47 @@ const (
 	PVUuidLabel = "pvuuid"
 	// DeviceAnnotation is the annotation that specifies the device path.
 	DeviceAnnotation = "device"
+	// StartTimeAnnotation is the annotation that specifies the job start time.
+	// This is the time when we begin to submit job to apiserver. We use this
+	// instead of job or pod start time to include k8s pod start latency into
+	// volume deletion time.
+	// Time is formatted in time.RFC3339Nano.
+	StartTimeAnnotation = "start-time"
 )
 
 // JobController defines the interface for the job controller.
 type JobController interface {
 	Run(stopCh <-chan struct{})
 	IsCleaningJobRunning(pvName string) bool
-	RemoveJob(pvName string) (CleanupState, error)
+	RemoveJob(pvName string) (CleanupState, *time.Time, error)
 }
 
 var _ JobController = &jobController{}
 
 type jobController struct {
 	*common.RuntimeConfig
-	namespace   string
-	client      kubernetes.Interface
-	queue       workqueue.RateLimitingInterface
-	jobInformer cache.SharedIndexInformer
-	jobLister   batchlisters.JobLister
+	namespace string
+	queue     workqueue.RateLimitingInterface
+	jobLister batchlisters.JobLister
 }
 
 // NewJobController instantiates  a new job controller.
-func NewJobController(client kubernetes.Interface, namespace string, labelmap map[string]string,
-	config *common.RuntimeConfig) (JobController, error) {
+func NewJobController(labelmap map[string]string, config *common.RuntimeConfig) (JobController, error) {
+	namespace := config.Namespace
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	labelset := labels.Set(labelmap)
 	optionsModifier := func(options *meta_v1.ListOptions) {
 		options.LabelSelector = labels.SelectorFromSet(labelset).String()
 	}
 
-	informer := cache.NewSharedIndexInformer(
-		cache.NewFilteredListWatchFromClient(client.BatchV1().RESTClient(), "jobs", namespace, optionsModifier),
-		&batch_v1.Job{},
-		resyncPeriod,
-		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
-	)
+	informer := config.InformerFactory.InformerFor(&batch_v1.Job{}, func(client kubernetes.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		return cache.NewSharedIndexInformer(
+			cache.NewFilteredListWatchFromClient(client.BatchV1().RESTClient(), "jobs", namespace, optionsModifier),
+			&batch_v1.Job{},
+			resyncPeriod,
+			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+		)
+	})
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -113,10 +118,8 @@ func NewJobController(client kubernetes.Interface, namespace string, labelmap ma
 	return &jobController{
 		RuntimeConfig: config,
 		namespace:     namespace,
-		client:        client,
 		queue:         queue,
 		jobLister:     batchlisters.NewJobLister(informer.GetIndexer()),
-		jobInformer:   informer,
 	}, nil
 
 }
@@ -128,15 +131,6 @@ func (c *jobController) Run(stopCh <-chan struct{}) {
 
 	glog.Infof("Starting Job controller")
 	defer glog.Infof("Shutting down Job controller")
-
-	go c.jobInformer.Run(stopCh)
-	// wait for the caches to synchronize before starting the worker
-	if !cache.WaitForCacheSync(stopCh, c.jobInformer.HasSynced) {
-		utilruntime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
-		return
-	}
-
-	glog.Infof("Job controller synced and ready")
 
 	// runWorker will loop until "something bad" happens.  The .Until will
 	// then rekick the worker after one second
@@ -225,44 +219,61 @@ func (c *jobController) IsCleaningJobRunning(pvName string) bool {
 }
 
 // RemoveJob returns true and deletes the job if the cleaning job has completed.
-func (c *jobController) RemoveJob(pvName string) (CleanupState, error) {
+func (c *jobController) RemoveJob(pvName string) (CleanupState, *time.Time, error) {
 	jobName := generateCleaningJobName(pvName)
 	job, err := c.jobLister.Jobs(c.namespace).Get(jobName)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return CSNotFound, nil
+			return CSNotFound, nil, nil
 		}
-		return CSUnknown, fmt.Errorf("Failed to check whether job %s has succeeded. Error - %s",
+		return CSUnknown, nil, fmt.Errorf("Failed to check whether job %s has succeeded. Error - %s",
 			jobName, err.Error())
+	}
+
+	var startTime *time.Time
+	if startTimeStr, ok := job.Annotations[StartTimeAnnotation]; ok {
+		parsedStartTime, err := time.Parse(time.RFC3339Nano, startTimeStr)
+		if err == nil {
+			startTime = &parsedStartTime
+		} else {
+			glog.Errorf("Failed to parse start time %s: %v", startTimeStr, err)
+		}
 	}
 
 	if job.Status.Succeeded == 0 {
 		// Jobs has not yet succeeded. We assume failed jobs to be still running, until addressed by admin.
-		return CSUnknown, fmt.Errorf("Error deleting Job %q: Cannot remove job that has not succeeded", job.Name)
+		return CSUnknown, nil, fmt.Errorf("Error deleting Job %q: Cannot remove job that has not succeeded", job.Name)
 	}
 
 	if err := c.RuntimeConfig.APIUtil.DeleteJob(job.Name, c.namespace); err != nil {
-		return CSUnknown, fmt.Errorf("Error deleting Job %q: %s", job.Name, err.Error())
+		return CSUnknown, nil, fmt.Errorf("Error deleting Job %q: %s", job.Name, err.Error())
 	}
 
-	return CSSucceeded, nil
+	return CSSucceeded, startTime, nil
 }
 
 // NewCleanupJob creates manifest for a cleaning job.
-func NewCleanupJob(pv *apiv1.PersistentVolume, imageName string, nodeName string, namespace string, blkdevPath string,
-	config common.MountConfig) *batch_v1.Job {
-	// Exec scripts expect devicepath as environment variables.
-	env := []apiv1.EnvVar{{Name: common.LocalPVEnv, Value: blkdevPath}}
+func NewCleanupJob(pv *apiv1.PersistentVolume, volMode apiv1.PersistentVolumeMode, imageName string, nodeName string, namespace string, mountPath string,
+	config common.MountConfig) (*batch_v1.Job, error) {
 	priv := true
 	// Container definition
 	jobContainer := apiv1.Container{
-		Name:    JobContainerName,
-		Image:   imageName,
-		Command: config.BlockCleanerCommand,
-		Env:     env,
+		Name:  JobContainerName,
+		Image: imageName,
 		SecurityContext: &apiv1.SecurityContext{
 			Privileged: &priv,
 		},
+	}
+	if volMode == apiv1.PersistentVolumeBlock {
+		jobContainer.Command = config.BlockCleanerCommand
+		jobContainer.Env = []apiv1.EnvVar{{Name: common.LocalPVEnv, Value: mountPath}}
+	} else if volMode == apiv1.PersistentVolumeFilesystem {
+		// We only have one way to clean filesystem, so no need to customize
+		// filesystem cleaner command.
+		jobContainer.Command = []string{"/scripts/fsclean.sh"}
+		jobContainer.Env = []apiv1.EnvVar{{Name: common.LocalFilesystemEnv, Value: mountPath}}
+	} else {
+		return nil, fmt.Errorf("unknown PersistentVolume mode: %v", volMode)
 	}
 	mountName := common.GenerateMountName(&config)
 	volumes := []apiv1.Volume{
@@ -289,7 +300,8 @@ func NewCleanupJob(pv *apiv1.PersistentVolume, imageName string, nodeName string
 
 	// Annotate job with useful information that cannot be set as labels due to label name restrictions.
 	annotations := map[string]string{
-		DeviceAnnotation: blkdevPath,
+		DeviceAnnotation:    mountPath,
+		StartTimeAnnotation: time.Now().Format(time.RFC3339Nano),
 	}
 
 	podTemplate := apiv1.Pod{}
@@ -309,7 +321,7 @@ func NewCleanupJob(pv *apiv1.PersistentVolume, imageName string, nodeName string
 	job.Spec.Template.Spec = podTemplate.Spec
 	job.Spec.Template.Spec.RestartPolicy = apiv1.RestartPolicyOnFailure
 
-	return job
+	return job, nil
 }
 
 func generateCleaningJobName(pvName string) string {
@@ -353,14 +365,14 @@ func (c *FakeJobController) IsCleaningJobRunning(pvName string) bool {
 }
 
 // RemoveJob mocks the interface method.
-func (c *FakeJobController) RemoveJob(pvName string) (CleanupState, error) {
+func (c *FakeJobController) RemoveJob(pvName string) (CleanupState, *time.Time, error) {
 	c.RemoveCompletedCount++
 	status, exists := c.pvCleanupRunning[pvName]
 	if !exists {
-		return CSNotFound, nil
+		return CSNotFound, nil, nil
 	}
 	if status != CSSucceeded {
-		return CSUnknown, fmt.Errorf("cannot remove job that has not yet completed %s status %d", pvName, status)
+		return CSUnknown, nil, fmt.Errorf("cannot remove job that has not yet completed %s status %d", pvName, status)
 	}
-	return CSSucceeded, nil
+	return CSSucceeded, nil, nil
 }
